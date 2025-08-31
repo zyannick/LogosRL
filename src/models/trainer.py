@@ -1,0 +1,425 @@
+import logging
+import time
+import traceback
+from contextlib import contextmanager
+from typing import Any, Dict, List, Optional
+
+import bitsandbytes as bnb
+import mlflow
+import torch
+from tqdm import tqdm
+from transformers import (
+    AutoTokenizer,
+)
+
+from models.environnement import GSM8KEnvironment
+from models.expert_usage_tracker import (
+    MoEModelWithTracking,
+    PatchedAutoModelForCausalLMWithValueHead,
+)
+from models.training_monitoring import PerformanceMonitor
+from models.training_strategy import PPOTrainingStrategy
+from utils.checkpoint_manager import CheckpointManager
+from utils.configurations import MoERLConfig
+from utils.exceptions import ResourceError, TrainingError
+from utils.ressource_manager import TrainingResourceManager
+
+# from trl.core import LengthSampler
+
+
+
+class MixtureOfExpertsTrainer:
+
+    def __init__(
+        self,
+        config: MoERLConfig,
+        tokenizer: AutoTokenizer,
+        policy_model: MoEModelWithTracking,
+        reference_model: PatchedAutoModelForCausalLMWithValueHead,
+        environment: GSM8KEnvironment,
+        logger: logging.Logger,
+        mlflow_client: mlflow.MlflowClient,
+        strategy: Optional[PPOTrainingStrategy] = None,
+        checkpoint_manager: Optional[CheckpointManager] = None,
+        performance_monitor: Optional[PerformanceMonitor] = None,
+    ):
+        """
+        Initializes the PPO-MoE trainer with the provided configuration, models, environment, and utilities.
+
+        Args:
+            config (MoERLConfig): Configuration object containing training parameters and settings.
+            tokenizer (AutoTokenizer): Tokenizer used for processing input and output sequences.
+            policy_model (MoEModelWithTracking): The policy model to be trained, supporting Mixture-of-Experts and tracking.
+            reference_model (PatchedAutoModelForCausalLMWithValueHead): Reference model used for reward calculation and comparison.
+            environment (GSM8KEnvironment): The RL environment for training, typically a math problem dataset.
+            logger (logging.Logger): Logger instance for tracking training progress and events.
+            mlflow_client (mlflow.MlflowClient): MLflow client for experiment tracking and logging.
+            strategy (Optional[PPOTrainingStrategy], optional): Custom PPO training strategy. Defaults to None.
+            checkpoint_manager (Optional[CheckpointManager], optional): Manager for saving and loading checkpoints. Defaults to None.
+            performance_monitor (Optional[PerformanceMonitor], optional): Monitor for tracking performance metrics. Defaults to None.
+
+        Attributes:
+            config (MoERLConfig): Trainer configuration.
+            training_config: Training parameters extracted from config.
+            logger (logging.Logger): Logger instance.
+            mlflow_client (mlflow.MlflowClient): MLflow client.
+            device (torch.device): Device used for training (CPU or CUDA).
+            policy_model (MoEModelWithTracking): Policy model.
+            reference_model (PatchedAutoModelForCausalLMWithValueHead): Reference model.
+            tokenizer (AutoTokenizer): Tokenizer.
+            environment (GSM8KEnvironment): RL environment.
+            optimizer (torch.optim.Optimizer or bnb.optim.AdamW8bit): Optimizer for training.
+            resource_manager (TrainingResourceManager): Resource manager for training.
+            performance_monitor (PerformanceMonitor): Performance monitor.
+            checkpoint_manager (CheckpointManager): Checkpoint manager.
+            strategy (PPOTrainingStrategy): PPO training strategy.
+            generation_kwargs (dict): Generation keyword arguments for model inference.
+            output_length_sampler (LengthSampler): Sampler for output sequence lengths.
+
+        Logs:
+            Trainer initialization details including device and configuration.
+        """
+        self.config = config
+        self.training_config = self.config.training_params
+
+        self.logger = logger
+        self.mlflow_client = mlflow_client
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.policy_model = policy_model.to(self.device)
+        self.reference_model = reference_model.to(self.device)
+        self.tokenizer: AutoTokenizer = tokenizer
+        self.environment = environment
+
+        if self.config.training_params.use_8bit_optimizer:
+            self.optimizer = bnb.optim.AdamW8bit(
+                self.policy_model.parameters(), lr=self.training_config.learning_rate
+            )
+        else:
+            self.optimizer = torch.optim.Adam(
+                self.policy_model.parameters(), lr=self.training_config.learning_rate
+            )
+
+        self.resource_manager = TrainingResourceManager(self.logger)
+        self.performance_monitor = performance_monitor or PerformanceMonitor()
+        self.checkpoint_manager = checkpoint_manager or CheckpointManager(
+            config.checkpoint_path
+        )
+        self.strategy = strategy or PPOTrainingStrategy(
+            self.resource_manager,
+            self.performance_monitor,
+            self.logger,
+            self.config,
+            self.mlflow_client,
+        )
+
+        self.generation_kwargs = self._get_generation_kwargs()
+
+        self.logger.info(
+            f"trainer_initialized: device {str(self.device)}, config={self.training_config.model_dump()}",
+        )
+
+    def _get_generation_kwargs(self) -> Dict[str, Any]:
+        """
+        Constructs a dictionary of generation parameters for text generation.
+
+        Returns:
+            Dict[str, Any]: A dictionary containing generation keyword arguments:
+                - min_length (int): Minimum length of generated sequences (default: 10).
+                - top_k (int): Number of highest probability vocabulary tokens to keep for top-k-filtering (default: 50).
+                - top_p (float): Cumulative probability for nucleus sampling (default: 0.9).
+                - temperature (float): Sampling temperature (default: 0.7).
+                - do_sample (bool): Whether to use sampling; if False, greedy decoding is used (default: True).
+                - pad_token_id (int): Token ID used for padding.
+                - max_new_tokens (int): Maximum number of new tokens to generate (default: 256).
+        """
+        return {
+            "min_length": getattr(self.config.training_params, "min_length", 10),
+            "top_k": getattr(self.config.training_params, "top_k", 50),
+            "top_p": getattr(self.config.training_params, "top_p", 0.9),
+            "temperature": getattr(self.config.training_params, "temperature", 0.7),
+            "do_sample": getattr(self.config.training_params, "do_sample", True),
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "max_new_tokens": getattr(
+                self.config.training_params, "max_new_tokens", 256
+            ),
+        }
+
+    @contextmanager
+    def training_context(self, epoch: int, batch_idx: int):
+        """
+        Context manager for training a batch during an epoch.
+
+        Args:
+            epoch (int): The current epoch number.
+            batch_idx (int): The index of the current batch.
+
+        Yields:
+            logger: The logger instance for recording training events.
+
+        Logs:
+            - "batch_started" when the batch processing begins.
+            - "batch_failed" with error details if an exception occurs.
+            - "batch_completed" with the duration of the batch processing.
+
+        Raises:
+            Exception: Propagates any exception that occurs during batch processing.
+        """
+
+        start_time = time.perf_counter()
+
+        self.logger.debug("batch_started")
+        try:
+            yield self.logger
+        except Exception as e:
+            self.logger.error(
+                f"batch_failed: error={str(e)}, error_type={type(e).__name__}"
+            )
+            raise
+        finally:
+            duration = time.perf_counter() - start_time
+            self.logger.debug(f"batch_completed: duration={duration}")
+
+    def _generate_responses(
+        self, query_tensors: torch.Tensor, max_retries: int = 3
+    ) -> torch.Tensor:
+        """
+        Generates response tensors from the given query tensors using the policy model,
+        with retry logic for handling GPU out-of-memory and other exceptions.
+
+        Args:
+            query_tensors (torch.Tensor): Input tensor(s) representing queries for response generation.
+            max_retries (int, optional): Maximum number of retry attempts in case of failure. Defaults to 3.
+
+        Returns:
+            torch.Tensor: Generated response tensors.
+
+        Raises:
+            ResourceError: If GPU out-of-memory error persists after all retry attempts.
+            TrainingError: If any other exception persists after all retry attempts.
+        """
+        for attempt in range(max_retries):
+            try:
+                with self.resource_manager.managed_computation("response_generation"):
+                    response_tensors = self.policy_model.generate(
+                        query_tensors,
+                        attention_mask=torch.ones_like(query_tensors),
+                        **self.generation_kwargs,
+                    )
+                    return response_tensors
+
+            except torch.cuda.OutOfMemoryError as e:
+                self.logger.warning(
+                    f"oom_during_generation: attempt {attempt}, max_retries {max_retries}"
+                )
+                if attempt == max_retries - 1:
+                    raise ResourceError(f"OOM after {max_retries} attempts: {e}") from e
+
+                self.resource_manager.cleanup_gpu_memory(force=True)
+                time.sleep(2**attempt)
+
+            except Exception as e:
+                self.logger.error(
+                    f"generation_failed: attempt={attempt}, error={str(e)}"
+                )
+                if attempt == max_retries - 1:
+                    raise TrainingError(
+                        f"Generation failed after {max_retries} attempts: {e}"
+                    ) from e
+                time.sleep(1)
+
+    def _compute_rewards_batch(
+        self,
+        queries: List[str],
+        response_tensors: torch.Tensor,
+        ground_truths: List[str],
+    ) -> List[torch.Tensor]:
+        """
+        Computes rewards for a batch of queries, responses, and ground truths.
+
+        Args:
+            queries (List[str]): List of input queries.
+            response_tensors (torch.Tensor): Tensor containing model-generated responses.
+            ground_truths (List[str]): List of ground truth answers.
+
+        Returns:
+            torch.Tensor: Tensor of computed rewards for each query-response-ground truth triplet.
+
+        Notes:
+            - Decodes response tensors to text using the tokenizer.
+            - Computes reward for each triplet using the environment's `compute_reward` method.
+            - If reward computation fails for a triplet, logs a warning and assigns a reward of 0.0.
+            - Returns rewards as a float32 tensor on the appropriate device.
+        """
+        responses_text = self.tokenizer.batch_decode(
+            response_tensors, skip_special_tokens=True
+        )
+
+        rewards = []
+        for query, response, ground_truth in zip(
+            queries, responses_text, ground_truths
+        ):
+            try:
+                reward = self.environment.compute_reward(query, response, ground_truth)
+                rewards.append(reward)
+            except Exception as e:
+                self.logger.warning(
+                    f"Reward computation failed for query '{query[:50]}...': {e}"
+                )
+                rewards.append(0.0)
+        return torch.tensor(rewards, dtype=torch.float32, device=self.device)
+
+    def train(self, run_id: str) -> Dict[str, Any]:
+        """
+        Trains the PPO-MoE model for a specified number of epochs, tracking performance and managing checkpoints.
+
+        Args:
+            run_id (str): Unique identifier for the training run.
+
+        Returns:
+            Dict[str, Any]: A summary dictionary containing training statistics, including:
+                - epochs_completed (int): Number of epochs completed.
+                - total_batches (int): Total number of batches processed.
+                - best_reward (float): Highest average reward achieved during training.
+                - training_time (float): Total training duration in seconds.
+                - early_stopped (bool): Whether early stopping was triggered.
+                - best_model_info (dict): Information about the best model checkpoint.
+                - performance (dict): Performance metrics summary.
+
+        Raises:
+            Exception: Propagates any exception encountered during training after logging the error.
+        """
+
+        self.logger.info(
+            f"training_started: num_epochs={self.training_config.num_epochs}, "
+            f"tracking_metric={self.checkpoint_manager.metric_name}"
+        )
+
+        training_summary = {
+            "epochs_completed": 0,
+            "total_batches": 0,
+            "best_reward": float("-inf"),
+            "training_time": 0,
+            "early_stopped": False,
+            "best_model_info": {},
+        }
+
+        training_start = time.perf_counter()
+        try:
+            for epoch in tqdm(range(self.training_config.num_epochs)):
+                epoch_start = time.perf_counter()
+
+                epoch_dataloader = self.environment.epoch_dataloader_sub_sampled()
+
+                epoch_metrics = self.strategy.run_training_step(
+                    self, epoch_dataloader, epoch, run_id
+                )
+
+                self.logger.debug("Epoch ended")
+
+                training_summary["epochs_completed"] = epoch + 1
+                training_summary["total_batches"] += len(epoch_dataloader)
+
+                current_reward = epoch_metrics.get("avg_reward", 0)
+                if current_reward > training_summary["best_reward"]:
+                    training_summary["best_reward"] = current_reward
+
+                model_updated = self.checkpoint_manager.update(
+                    self,
+                    current_metrics=epoch_metrics,
+                    # model_state=self.policy_model.state_dict(),
+                    # optimizer_state=self.optimizer.state_dict(),
+                    epoch=epoch,
+                )
+
+                if model_updated:
+                    self.logger.info(
+                        f"New best model found at epoch {epoch}! "
+                        f"{self.checkpoint_manager.metric_name}={self.checkpoint_manager.best_value:.4f}"
+                    )
+
+                epoch_duration = time.perf_counter() - epoch_start
+                self.logger.info(
+                    f"epoch_completed: epoch={epoch}, duration={epoch_duration}"
+                )
+                self._display_epoch_end(epoch, epoch_duration, epoch_metrics)
+
+                if self.checkpoint_manager.should_early_stop():
+                    self.logger.info(
+                        f"Early stopping triggered at epoch {epoch}. "
+                        f"No improvement for {self.checkpoint_manager.patience} epochs."
+                    )
+                    training_summary["early_stopped"] = True
+                    break
+
+            training_summary["best_model_info"] = (
+                self.checkpoint_manager.get_best_info()
+            )
+            training_summary["training_time"] = time.perf_counter() - training_start
+
+            perf_summary = self.performance_monitor.get_performance_summary()
+            training_summary["performance"] = perf_summary
+
+            self.logger.info(f"training_completed: summary={training_summary}")
+
+            best_info = training_summary["best_model_info"]
+            self.logger.info(
+                f"Best model: Epoch {best_info['best_epoch']} with "
+                f"{best_info['metric_name']}={best_info['best_value']:.4f}"
+            )
+
+            return training_summary
+
+        except Exception as e:
+            self.logger.error(
+                f"training_failed: error={str(e)}, error_type={type(e).__name__}"
+            )
+            self.logger.debug(traceback.format_exc())
+            raise
+        finally:
+            training_duration = time.perf_counter() - training_start
+            self.logger.info(f"Training finished in {training_duration:.2f}s.")
+            perf_summary = self.performance_monitor.get_performance_summary()
+            self.logger.info(f"Performance Summary: {perf_summary}")
+
+    def _display_epoch_end(self, epoch, epoch_duration, epoch_metrics):
+        epoch_metrics_str = ""
+        for key, value in epoch_metrics.items():
+            epoch_metrics_str += f"  {key}: {float(value)}\n"
+        self.logger.info(
+            f"Epoch {epoch} ended with duration: {epoch_duration}, \n metrics:\n {epoch_metrics_str}"
+        )
+
+    def load_checkpoint(self, checkpoint_path: str):
+        self.logger.info(f"Loading checkpoint from {checkpoint_path}")
+        self.strategy.load_checkpoint(self, checkpoint_path)
+
+    def evaluate(self):
+        self.logger.info("Starting evaluation")
+        eval_results = self.strategy.evaluate(self, self.environment.test_dataloader)
+        self.logger.info(f"Evaluation results: {eval_results}")
+        return eval_results
+
+    def evaluate_sample(self, question: str) -> str:
+        try:
+            prompt = self.environment.format_prompt(question)
+            inputs = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
+
+            with torch.no_grad():
+                with self.resource_manager.managed_computation("inference"):
+                    outputs = self.policy_model.generate(
+                        inputs,
+                        max_new_tokens=200,
+                        temperature=0.7,
+                        do_sample=True,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                    )
+
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            return response[len(prompt) :].strip()
+
+        except Exception as e:
+            self.logger.error(
+                f"evaluation_failed: question={question[:50]}, error={str(e)}"
+            )
+            return f"Error during evaluation: {str(e)}"
