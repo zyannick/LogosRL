@@ -1,5 +1,13 @@
 # Logos RL
 
+![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?logo=pytorch&logoColor=white)
+![Multi-GPU](https://img.shields.io/badge/Scalability-Multi--GPU-brightgreen.svg)
+![Python Version](https://img.shields.io/badge/python-3.12-blue.svg)
+![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)
+![DVC](https://img.shields.io/badge/DVC-Versioned-blue?logo=dvc)
+![Docker](https://img.shields.io/badge/Docker-Containerized-blue?logo=docker)
+![MLflow](https://img.shields.io/badge/MLflow-Tracking-blue?logo=mlflow)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
 In this project, we will try to implement from scratch reinforcement learning algorithms for mathematical reasoning and de novo proteins generations.
 
