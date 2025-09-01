@@ -18,7 +18,7 @@ from models.expert_usage_tracker import (
     PatchedAutoModelForCausalLMWithValueHead,
 )
 from models.training_monitoring import PerformanceMonitor
-from models.training_strategy import PPOTrainingStrategy
+from models.training_strategy import TrainingStrategy
 from utils.checkpoint_manager import CheckpointManager
 from utils.configurations import MoERLConfig
 from utils.exceptions import ResourceError, TrainingError
@@ -39,7 +39,7 @@ class MixtureOfExpertsTrainer:
         environment: GSM8KEnvironment,
         logger: logging.Logger,
         mlflow_client: mlflow.MlflowClient,
-        strategy: Optional[PPOTrainingStrategy] = None,
+        strategy: Optional[TrainingStrategy] = None,
         checkpoint_manager: Optional[CheckpointManager] = None,
         performance_monitor: Optional[PerformanceMonitor] = None,
     ):
@@ -105,7 +105,7 @@ class MixtureOfExpertsTrainer:
         self.checkpoint_manager = checkpoint_manager or CheckpointManager(
             config.checkpoint_path
         )
-        self.strategy = strategy or PPOTrainingStrategy(
+        self.strategy = strategy or TrainingStrategy(
             self.resource_manager,
             self.performance_monitor,
             self.logger,

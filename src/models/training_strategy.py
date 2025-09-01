@@ -67,7 +67,7 @@ class AdaptiveKLController:
         self.kl_coef *= factor
 
 
-class PPOTrainingStrategy:
+class TrainingStrategy:
 
     def __init__(
         self,
