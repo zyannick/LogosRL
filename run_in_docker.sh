@@ -6,11 +6,11 @@ IMAGE_TAG="moe-rl-app"
 PIPELINE_STAGE=$1
 EXTRA_DOCKER_ARGS=""
 
-mkdir -p ./data ./logs ./ppo_moe_outputs ./mlruns hf_cache
+mkdir -p ./data ./logs ./moe_outputs ./mlruns hf_cache
 
 
 COMMON_MOUNTS="-v ./data:/app/data \
-               -v ./ppo_moe_outputs:/app/ppo_moe_outputs \
+               -v ./moe_outputs:/app/moe_outputs \
                -v ./mlruns:/app/mlruns \
                -v ./logs:/app/logs \
                -v ./hf_cache:/app/hf_cache \
@@ -30,6 +30,7 @@ fi
 docker run --rm \
   --user $(id -u):$(id -g) \
   -e HF_HOME=/app/hf_cache \
+  -e MPLCONFIGDIR=/app/mpl_config \
   $EXTRA_DOCKER_ARGS \
   $IMAGE_TAG \
-  python src/run_pipeline.py --pipeline_stage $PIPELINE_STAGE
+  torchrun --nproc_per_node=auto src/run_pipeline.py --pipeline_stage $PIPELINE_STAGE

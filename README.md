@@ -52,8 +52,8 @@ This project uses Docker and DVC to ensure a completely reproducible environment
     ```
     or
     ```bash
-    # Launch the full pipeline inside a docker
-    python src/run_pipeline.py --pipeline_stage full_pipeline
+    # Launch the full pipeline
+    torchrun --nproc_per_node=auto src/run_pipeline.py --pipeline_stage full_pipeline
     ```
 
     The final model, checkpoints, and metrics will be available in the `moe_outputs/` directory, and experiment results can be viewed via the MLflow UI.

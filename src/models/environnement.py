@@ -125,17 +125,7 @@ class GSM8KEnvironment:
         )
         return train_dataloader
 
-    def epoch_dataloader_sub_sampled(self) -> torch.utils.data.DataLoader:
-        """
-        Creates a DataLoader for a randomly sub-sampled subset of the training dataset for the current epoch.
-
-        The method randomly shuffles the training dataset and selects up to `max_samples_per_epoch` samples.
-        It then constructs a DataLoader using the selected subset, applying a custom data collator and batching.
-
-        Returns:
-            torch.utils.data.DataLoader: DataLoader for the sub-sampled training dataset for the epoch.
-        """
-        data_collator = CustomDataCollator(tokenizer=self.tokenizer)
+    def epoch_dataset(self):
 
         num_samples = len(self.train_dataset)
         max_samples = self.config.training_params.max_samples_per_epoch
@@ -146,10 +136,30 @@ class GSM8KEnvironment:
 
         epoch_dataset = self.train_dataset.select(subset_indices)
 
+        return epoch_dataset
+
+    @property
+    def data_collator(self):
+        data_collator = CustomDataCollator(tokenizer=self.tokenizer)
+        return data_collator
+
+    def epoch_dataloader_sub_sampled(self) -> torch.utils.data.DataLoader:
+        """
+        Creates a DataLoader for a randomly sub-sampled subset of the training dataset for the current epoch.
+
+        The method randomly shuffles the training dataset and selects up to `max_samples_per_epoch` samples.
+        It then constructs a DataLoader using the selected subset, applying a custom data collator and batching.
+
+        Returns:
+            torch.utils.data.DataLoader: DataLoader for the sub-sampled training dataset for the epoch.
+        """
+
+        epoch_dataset = self.epoch_dataset()
+
         train_dataloader = torch.utils.data.DataLoader(
             epoch_dataset,
             batch_size=self.config.training_params.batch_size,
-            collate_fn=data_collator,
+            collate_fn=self.data_collator,
             shuffle=True,
             num_workers=4,
         )

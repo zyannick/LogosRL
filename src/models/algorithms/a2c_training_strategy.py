@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Dict, Tuple
+from typing import TYPE_CHECKING, Dict, Tuple
 
 import mlflow
 import torch
@@ -8,7 +8,11 @@ from torch.amp import autocast
 from tqdm import tqdm
 
 from models.algorithms.training_strategy import TrainingStrategy
-from models.trainer import MixtureOfExpertsTrainer
+from models.utils.distributed_manager import DistributedManager
+
+if TYPE_CHECKING:
+    from models.trainer import MixtureOfExpertsTrainer
+
 from models.training_monitoring import PerformanceMonitor
 from models.utils.loss import (
     compute_advantages,
@@ -32,6 +36,7 @@ class A2CTrainingStrategy(TrainingStrategy):
         logger: logging.Logger,
         config: MoERLConfig,
         mlflow_client: mlflow.MlflowClient,
+        distributed_manager: DistributedManager,
     ):
         super().__init__(
             resource_manager,
@@ -39,6 +44,7 @@ class A2CTrainingStrategy(TrainingStrategy):
             logger,
             config,
             mlflow_client,
+            distributed_manager=distributed_manager,
         )
 
     def _collect_rollout(

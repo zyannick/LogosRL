@@ -22,6 +22,7 @@ from models.expert_usage_tracker import (
     PatchedAutoModelForCausalLMWithValueHead,
 )
 from models.trainer import MixtureOfExpertsTrainer
+from models.utils.distributed_manager import DistributedManager
 from utils.configurations import MoERLConfig
 from utils.exceptions import (
     ModelLoadError,
@@ -160,7 +161,12 @@ class PipelineResourceManager:
 
 class ModelManager:
 
-    def __init__(self, config: MoERLConfig, logger: logging.Logger):
+    def __init__(
+        self,
+        config: MoERLConfig,
+        logger: logging.Logger,
+        dist_manager: DistributedManager,
+    ):
         """
         Initializes the pipeline with the given configuration and logger.
 
@@ -184,6 +190,8 @@ class ModelManager:
         self.policy_model: Optional[MoEModelWithTracking] = None
         self.reference_model: Optional[PatchedAutoModelForCausalLMWithValueHead] = None
         self._pipeline_resource_manager = PipelineResourceManager(logger)
+        self.dist_manager = dist_manager
+        self.device = self.dist_manager.device
 
     async def initialize(self) -> None:
         """
@@ -195,18 +203,22 @@ class ModelManager:
             ModelLoadError: If any error occurs during model initialization.
         """
         try:
-            self.logger.info(
-                f"Loading tokenizer: model_name={self.config.pretrained_model_name}"
-            )
-            self.tokenizer = await self._load_tokenizer()
+            if self.dist_manager.is_main_process:
+                self.logger.info("Main process is downloading models and tokenizer...")
+                await self._load_tokenizer()
+                await self._load_quantized_base_model()
+
+            if self.dist_manager.is_distributed:
+                torch.distributed.barrier()
 
             self.logger.info(
-                f"Loading base model: model_name={self.config.pretrained_model_name}"
+                f"Rank {self.dist_manager.rank}: Loading models from cache."
             )
+            self.tokenizer = await self._load_tokenizer()
             base_model = await self._load_quantized_base_model()
             self._pipeline_resource_manager.register(base_model)
 
-            self.logger.info("Wrapping models")
+            self.logger.info(f"Rank {self.dist_manager.rank}: Wrapping models.")
             self.policy_model = self._create_peft_model(base_model, "policy_model")
             self.policy_model = MoEModelWithTracking(
                 model=self.policy_model, logger=self.logger
@@ -215,13 +227,20 @@ class ModelManager:
             self.reference_model = (
                 PatchedAutoModelForCausalLMWithValueHead.from_pretrained(base_model)
             )
+
+            self.policy_model.to(self.device)
+            self.reference_model.to(self.device)
             self.reference_model.eval()
+
             self._pipeline_resource_manager.register(self.policy_model)
             self._pipeline_resource_manager.register(self.reference_model)
 
-            self.config.checkpoint_path.mkdir(parents=True, exist_ok=True)
+            if self.dist_manager.is_main_process:
+                self.config.checkpoint_path.mkdir(parents=True, exist_ok=True)
 
-            self.logger.info("Models initialized successfully")
+            self.logger.info(
+                f"Rank {self.dist_manager.rank}: Models initialized successfully."
+            )
 
         except Exception as e:
             self.logger.error(f"Model initialization failed: {e}")
@@ -343,8 +362,8 @@ class ModelManager:
             base_model = AutoModelForCausalLM.from_pretrained(
                 self.config.pretrained_model_name,
                 quantization_config=quantization_config,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
+                dtype=torch.bfloat16,
+                device_map=None,
             )
 
             if torch.cuda.is_available():
@@ -467,28 +486,18 @@ class DataManager:
 
 class TrainingManager:
     def __init__(
-        self, model_manager: ModelManager, config: MoERLConfig, logger: logging.Logger
+        self,
+        model_manager: ModelManager,
+        config: MoERLConfig,
+        distributed_manager: DistributedManager,
+        logger: logging.Logger,
     ):
-        """
-        Initializes the pipeline with the provided model manager, configuration, and logger.
 
-        Args:
-            model_manager (ModelManager): The manager responsible for handling models.
-            config (MoERLConfig): Configuration object for the MoE RL pipeline.
-            logger (logging.Logger): Logger instance for logging pipeline events.
-
-        Attributes:
-            model_manager (ModelManager): Stores the provided model manager.
-            config (MoERLConfig): Stores the pipeline configuration.
-            logger (logging.Logger): Stores the logger instance.
-            ppo_trainer (Optional[PPOMoETrainer]): PPO trainer, initialized as None.
-            environment (Optional[GSM8KEnvironment]): RL environment, initialized as None.
-            mlflow_client (mlflow.MlflowClient): MLflow client for experiment tracking.
-        """
         self.model_manager = model_manager
         self.config = config
         self.logger = logger
-        self.ppo_trainer: Optional[MixtureOfExpertsTrainer] = None
+        self.distributed_manager = distributed_manager
+        self.moe_trainer: Optional[MixtureOfExpertsTrainer] = None
         self.environment: Optional[GSM8KEnvironment] = None
         self.mlflow_client = mlflow.MlflowClient()
 
@@ -507,7 +516,7 @@ class TrainingManager:
             self.environment = GSM8KEnvironment(
                 self.config, self.model_manager.tokenizer, self.logger
             )
-            self.ppo_trainer = MixtureOfExpertsTrainer(
+            self.moe_trainer = MixtureOfExpertsTrainer(
                 config=self.config,
                 tokenizer=self.model_manager.tokenizer,
                 policy_model=self.model_manager.policy_model,
@@ -515,6 +524,7 @@ class TrainingManager:
                 environment=self.environment,
                 logger=self.logger,
                 mlflow_client=self.mlflow_client,
+                distributed_manager=self.distributed_manager,
             )
             self.logger.info("Training components initialized")
 
@@ -566,7 +576,7 @@ class TrainingManager:
             StateTransitionError: If the PPO trainer is not initialized.
         """
         try:
-            if not self.ppo_trainer:
+            if not self.moe_trainer:
                 raise StateTransitionError("Training not initialized")
 
             mlflow.set_experiment(self.config.experiment_name)
@@ -579,7 +589,7 @@ class TrainingManager:
 
                 self._init_mlflow()
                 self.logger.info("Starting model training")
-                await asyncio.to_thread(self.ppo_trainer.train, run_id)
+                await asyncio.to_thread(self.moe_trainer.train, run_id)
 
                 self.logger.info("Training completed successfully")
                 return PipelineResult(success=True)
@@ -606,7 +616,7 @@ class TrainingManager:
             StateTransitionError: If the pipeline is not properly initialized for evaluation.
         """
         try:
-            if not self.ppo_trainer or not self.model_manager.policy_model:
+            if not self.moe_trainer or not self.model_manager.policy_model:
                 raise StateTransitionError("Pipeline not initialized for evaluation")
 
             self.logger.info(
@@ -616,10 +626,10 @@ class TrainingManager:
             await self.model_manager.load_best_checkpoint_for_evaluation()
 
             self.model_manager.policy_model.eval()
-            self.ppo_trainer.policy_model = self.model_manager.policy_model
+            self.moe_trainer.policy_model = self.model_manager.policy_model
 
             self.logger.info("Model is ready. Starting evaluation.")
-            metrics = await asyncio.to_thread(self.ppo_trainer.evaluate)
+            metrics = await asyncio.to_thread(self.moe_trainer.evaluate)
 
             self.logger.info(f"Evaluation completed: metrics = {metrics}")
             return PipelineResult(success=True, data=metrics, metrics=metrics)
@@ -788,7 +798,7 @@ class PipelineStateMachine:
                 PipelineState.READY,
                 PipelineState.ERROR,
                 PipelineState.CLEANUP,
-                PipelineState.INFERRING
+                PipelineState.INFERRING,
             ],
             PipelineState.DATA_PREPARING: [
                 PipelineState.READY,
@@ -886,12 +896,16 @@ class MoERLPipeline:
             "moe_pipeline.log", Path(self.config.logging_params.log_dir)
         ).get_logger()
 
+        self.distributed_manager = DistributedManager(self.logger)
+
         self.state_machine = PipelineStateMachine(self.logger)
 
-        self.model_manager = ModelManager(self.config, self.logger)
+        self.model_manager = ModelManager(
+            self.config, self.logger, self.distributed_manager
+        )
         self.data_manager = DataManager(self.config, self.logger)
         self.training_manager = TrainingManager(
-            self.model_manager, self.config, self.logger
+            self.model_manager, self.config, self.distributed_manager, self.logger
         )
         self.inference_engine = InferenceEngine(self.model_manager, self.logger)
 
@@ -1034,7 +1048,7 @@ class MoERLPipeline:
 
         if isinstance(prompts, str):
             prompts = [prompts]
-            
+
         self.logger.info(f"Number of prompts to process: {len(prompts)}")
 
         request = InferenceRequest(prompts=prompts, **kwargs)

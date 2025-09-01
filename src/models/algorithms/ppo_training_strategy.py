@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 from models.algorithms.training_strategy import TrainingStrategy
 from models.training_monitoring import PerformanceMonitor
+from models.utils.distributed_manager import DistributedManager
 from models.utils.loss import (
     compute_advantages,
     compute_entropy_loss,
@@ -71,6 +72,7 @@ class PPOTrainingStrategy(TrainingStrategy):
         logger: logging.Logger,
         config: MoERLConfig,
         mlflow_client: mlflow.MlflowClient,
+        distributed_manager: DistributedManager,
     ):
         super().__init__(
             resource_manager=resource_manager,
@@ -78,6 +80,7 @@ class PPOTrainingStrategy(TrainingStrategy):
             logger=logger,
             config=config,
             mlflow_client=mlflow_client,
+            distributed_manager=distributed_manager,
         )
 
         self.kl_controller = AdaptiveKLController(

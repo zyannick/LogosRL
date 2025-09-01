@@ -11,6 +11,7 @@ from torch.amp import GradScaler
 from tqdm import tqdm
 
 from models.training_monitoring import PerformanceMetrics, PerformanceMonitor
+from models.utils.distributed_manager import DistributedManager
 from models.utils.metrics import mlflow_log_metrics
 from models.utils.vizualisation import (
     plot_layer_wise_expert_heatmap,
@@ -34,12 +35,14 @@ class TrainingStrategy:
         logger: logging.Logger,
         config: MoERLConfig,
         mlflow_client: mlflow.MlflowClient,
+        distributed_manager: DistributedManager,
     ):
         self.resource_manager = resource_manager
         self.performance_monitor = performance_monitor
         self.logger = logger
         self.config = config
         self.mlflow_client = mlflow_client
+        self.distributed_manager = distributed_manager
         self.bleu_metric = evaluate.load("bleu")
         self.rouge_metric = evaluate.load("rouge")
         self.expert_usage_stats: List[Dict[str, Any]] = []
@@ -76,20 +79,30 @@ class TrainingStrategy:
                     batch_start_time = time.perf_counter()
 
                     rollout_start_time = time.perf_counter()
-                    rollout_data, metrics = self._collect_rollout(trainer, batch_data)
+                    local_rollout_data, local_metrics = self._collect_rollout(
+                        trainer, batch_data
+                    )
                     rollout_time = time.perf_counter() - rollout_start_time
 
                     update_policy_start_time = time.perf_counter()
-                    update_metrics = self._update_policy(trainer, rollout_data)
+                    update_metrics = self._update_policy(trainer, local_rollout_data)
                     update_policy_time = time.perf_counter() - update_policy_start_time
 
-                    metrics.update(update_metrics)
-                    epoch_metrics.append(metrics)
+                    if self.distributed_manager.is_main_process:
+                        local_metrics = self.distributed_manager.reduce_metrics(
+                            local_metrics
+                        )
+                        update_metrics = self.distributed_manager.reduce_metrics(
+                            update_metrics
+                        )
+
+                    local_metrics.update(update_metrics)
+                    epoch_metrics.append(local_metrics)
 
                     mlflow_log_metrics(
                         self.mlflow_client,
                         self.config,
-                        metrics,
+                        local_metrics,
                         step=epoch * len(dataloader) + batch_idx,
                         run_id=run_id,
                     )
@@ -99,8 +112,8 @@ class TrainingStrategy:
 
                     perf_metric = PerformanceMetrics(
                         batch_processing_time=processing_time,
-                        generation_time=metrics.get("generation_time", 0),
-                        reward_computation_time=metrics.get("reward_time", 0),
+                        generation_time=local_metrics.get("generation_time", 0),
+                        reward_computation_time=local_metrics.get("reward_time", 0),
                         gpu_memory_usage=memory_stats["used"],
                         rollout_time=rollout_time,
                         update_policy_time=update_policy_time,
@@ -110,10 +123,10 @@ class TrainingStrategy:
                     self.performance_monitor.record_metric(perf_metric)
 
                     display_metrics = {
-                        "reward": f"{metrics.get('reward', 0):.4f}",
-                        "policy_loss": f"{metrics.get('policy_loss', 0):.4f}",
-                        "entropy_loss": f"{metrics.get('entropy_loss', 0):.4f}",
-                        "kl_div": f"{metrics.get('kl_div', 0):.4f}",
+                        "reward": f"{local_metrics.get('reward', 0):.4f}",
+                        "policy_loss": f"{local_metrics.get('policy_loss', 0):.4f}",
+                        "entropy_loss": f"{local_metrics.get('entropy_loss', 0):.4f}",
+                        "kl_div": f"{local_metrics.get('kl_div', 0):.4f}",
                     }
                     progress_bar.set_postfix(**display_metrics)
 

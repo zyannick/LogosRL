@@ -5,8 +5,9 @@ __pycache__/
 
 # C extensions
 *.so
-
+data/
 .vscode
+moe_outputs/
 
 # Distribution / packaging
 .Python

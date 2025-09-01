@@ -1,12 +1,13 @@
 import logging
 import time
 import traceback
-from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 import bitsandbytes as bnb
 import mlflow
 import torch
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from transformers import (
     AutoTokenizer,
@@ -20,6 +21,7 @@ from models.expert_usage_tracker import (
     PatchedAutoModelForCausalLMWithValueHead,
 )
 from models.training_monitoring import PerformanceMonitor
+from models.utils.distributed_manager import DistributedManager
 from utils.checkpoint_manager import CheckpointManager
 from utils.configurations import MoERLConfig
 from utils.exceptions import ResourceError, TrainingError
@@ -37,6 +39,7 @@ class MixtureOfExpertsTrainer:
         environment: GSM8KEnvironment,
         logger: logging.Logger,
         mlflow_client: mlflow.MlflowClient,
+        distributed_manager: DistributedManager,
         strategy: Optional[PPOTrainingStrategy | A2CTrainingStrategy] = None,
         checkpoint_manager: Optional[CheckpointManager] = None,
         performance_monitor: Optional[PerformanceMonitor] = None,
@@ -46,9 +49,10 @@ class MixtureOfExpertsTrainer:
 
         self.logger = logger
         self.mlflow_client = mlflow_client
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.distributed_manager = distributed_manager
+        self.device = self.distributed_manager.device
 
-        self.policy_model = policy_model.to(self.device)
+        self.policy_model = self.distributed_manager.wrap_model(policy_model)
         self.reference_model = reference_model.to(self.device)
         self.tokenizer: AutoTokenizer = tokenizer
         self.environment = environment
@@ -76,6 +80,7 @@ class MixtureOfExpertsTrainer:
                 self.logger,
                 self.config,
                 self.mlflow_client,
+                distributed_manager=distributed_manager,
             )
         elif self.config.algorithm == "a2c":
             self.strategy = A2CTrainingStrategy(
@@ -84,6 +89,7 @@ class MixtureOfExpertsTrainer:
                 self.logger,
                 self.config,
                 self.mlflow_client,
+                distributed_manager=distributed_manager,
             )
 
         self.generation_kwargs = self._get_generation_kwargs()
@@ -118,41 +124,6 @@ class MixtureOfExpertsTrainer:
             ),
         }
 
-    @contextmanager
-    def training_context(self, epoch: int, batch_idx: int):
-        """
-        Context manager for training a batch during an epoch.
-
-        Args:
-            epoch (int): The current epoch number.
-            batch_idx (int): The index of the current batch.
-
-        Yields:
-            logger: The logger instance for recording training events.
-
-        Logs:
-            - "batch_started" when the batch processing begins.
-            - "batch_failed" with error details if an exception occurs.
-            - "batch_completed" with the duration of the batch processing.
-
-        Raises:
-            Exception: Propagates any exception that occurs during batch processing.
-        """
-
-        start_time = time.perf_counter()
-
-        self.logger.debug("batch_started")
-        try:
-            yield self.logger
-        except Exception as e:
-            self.logger.error(
-                f"batch_failed: error={str(e)}, error_type={type(e).__name__}"
-            )
-            raise
-        finally:
-            duration = time.perf_counter() - start_time
-            self.logger.debug(f"batch_completed: duration={duration}")
-
     def _generate_responses(
         self, query_tensors: torch.Tensor, max_retries: int = 3
     ) -> torch.Tensor:
@@ -171,15 +142,20 @@ class MixtureOfExpertsTrainer:
             ResourceError: If GPU out-of-memory error persists after all retry attempts.
             TrainingError: If any other exception persists after all retry attempts.
         """
+        unwrapped_model = (
+            self.policy_model.module
+            if self.distributed_manager.is_distributed
+            else self.policy_model
+        )
         for attempt in range(max_retries):
             try:
                 with self.resource_manager.managed_computation("response_generation"):
-                    response_tensors = self.policy_model.generate(
-                        query_tensors,
-                        attention_mask=torch.ones_like(query_tensors),
-                        **self.generation_kwargs,
-                    )
-                    return response_tensors
+                    with torch.inference_mode():  # Use inference_mode for better performance
+                        return unwrapped_model.generate(
+                            query_tensors,
+                            attention_mask=torch.ones_like(query_tensors),
+                            **self.generation_kwargs,
+                        )
 
             except torch.cuda.OutOfMemoryError as e:
                 self.logger.warning(
@@ -277,69 +253,52 @@ class MixtureOfExpertsTrainer:
             "best_model_info": {},
         }
 
+        train_dataset = self.environment.train_dataset
+
+        sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=self.distributed_manager.world_size,
+            rank=self.distributed_manager.rank,
+            shuffle=True,
+        )
+
+        data_loader = DataLoader(
+            train_dataset,
+            batch_size=self.training_config.batch_size,
+            sampler=sampler,
+            num_workers=4,
+            collate_fn=self.environment.data_collator,
+            pin_memory=True,
+        )
+        training_summary["total_batches"] += len(data_loader)
+
         training_start = time.perf_counter()
         try:
             for epoch in tqdm(range(self.training_config.num_epochs)):
                 epoch_start = time.perf_counter()
+                sampler.set_epoch(epoch)
 
-                epoch_dataloader = self.environment.epoch_dataloader_sub_sampled()
+                if self.distributed_manager.is_main_process:
+                    progress_bar = tqdm(data_loader, desc=f"Epoch {epoch}")
+                else:
+                    progress_bar = data_loader
 
                 epoch_metrics = self.strategy.run_training_step(
-                    self, epoch_dataloader, epoch, run_id
+                    self, progress_bar, epoch, run_id
                 )
 
-                self.logger.debug("Epoch ended")
+                if self.distributed_manager.is_distributed:
+                    torch.distributed.barrier()
 
-                training_summary["epochs_completed"] = epoch + 1
-                training_summary["total_batches"] += len(epoch_dataloader)
+                if self.distributed_manager.is_main_process:
 
-                current_reward = epoch_metrics.get("avg_reward", 0)
-                if current_reward > training_summary["best_reward"]:
-                    training_summary["best_reward"] = current_reward
-
-                model_updated = self.checkpoint_manager.update(
-                    self,
-                    current_metrics=epoch_metrics,
-                    epoch=epoch,
-                )
-
-                if model_updated:
-                    self.logger.info(
-                        f"New best model found at epoch {epoch}! "
-                        f"{self.checkpoint_manager.metric_name}={self.checkpoint_manager.best_value:.4f}"
+                    self.on_epoch_end(
+                        epoch,
+                        epoch_duration=time.perf_counter() - epoch_start,
+                        epoch_metrics=epoch_metrics,
+                        training_summary=training_summary,
+                        epoch_start=epoch_start,
                     )
-
-                epoch_duration = time.perf_counter() - epoch_start
-                self.logger.info(
-                    f"epoch_completed: epoch={epoch}, duration={epoch_duration}"
-                )
-                self._display_epoch_end(epoch, epoch_duration, epoch_metrics)
-
-                if self.checkpoint_manager.should_early_stop():
-                    self.logger.info(
-                        f"Early stopping triggered at epoch {epoch}. "
-                        f"No improvement for {self.checkpoint_manager.patience} epochs."
-                    )
-                    training_summary["early_stopped"] = True
-                    break
-
-            training_summary["best_model_info"] = (
-                self.checkpoint_manager.get_best_info()
-            )
-            training_summary["training_time"] = time.perf_counter() - training_start
-
-            perf_summary = self.performance_monitor.get_performance_summary()
-            training_summary["performance"] = perf_summary
-
-            self.logger.info(f"training_completed: summary={training_summary}")
-
-            best_info = training_summary["best_model_info"]
-            self.logger.info(
-                f"Best model: Epoch {best_info['best_epoch']} with "
-                f"{best_info['metric_name']}={best_info['best_value']:.4f}"
-            )
-
-            return training_summary
 
         except Exception as e:
             self.logger.error(
@@ -348,10 +307,81 @@ class MixtureOfExpertsTrainer:
             self.logger.debug(traceback.format_exc())
             raise
         finally:
-            training_duration = time.perf_counter() - training_start
-            self.logger.info(f"Training finished in {training_duration:.2f}s.")
-            perf_summary = self.performance_monitor.get_performance_summary()
-            self.logger.info(f"Performance Summary: {perf_summary}")
+            self.on_train_end(training_summary, training_start)
+
+        return training_summary
+
+    def on_epoch_end(
+        self, epoch, epoch_duration, epoch_metrics, training_summary, epoch_start
+    ):
+        model_to_save = (
+            self.policy_model.module
+            if self.distributed_manager.is_distributed
+            else self.policy_model
+        )
+
+        tokenizer_to_save = self.tokenizer
+
+        self.logger.debug("Epoch ended")
+
+        training_summary["epochs_completed"] = epoch + 1
+
+        current_reward = epoch_metrics.get("avg_reward", 0)
+        if current_reward > training_summary["best_reward"]:
+            training_summary["best_reward"] = current_reward
+
+        self.logger.debug("Epoch ended on main process.")
+
+        model_updated = self.checkpoint_manager.update(
+            model_to_save,
+            tokenizer_to_save,
+            self.config,
+            self.device,
+            current_metrics=epoch_metrics,
+            epoch=epoch,
+        )
+
+        if model_updated:
+            self.logger.info(
+                f"New best model found at epoch {epoch}! "
+                f"{self.checkpoint_manager.metric_name}={self.checkpoint_manager.best_value:.4f}"
+            )
+
+        epoch_duration = time.perf_counter() - epoch_start
+        self.logger.info(f"epoch_completed: epoch={epoch}, duration={epoch_duration}")
+        self._display_epoch_end(epoch, epoch_duration, epoch_metrics)
+
+        if self.checkpoint_manager.should_early_stop():
+            self.logger.info(
+                f"Early stopping triggered at epoch {epoch}. "
+                f"No improvement for {self.checkpoint_manager.patience} epochs."
+            )
+            training_summary["early_stopped"] = True
+            training_summary["early_stopping_epoch"] = epoch
+
+        return training_summary
+
+    def on_train_end(self, training_summary, training_start):
+
+        training_summary["best_model_info"] = self.checkpoint_manager.get_best_info()
+        training_summary["training_time"] = time.perf_counter() - training_start
+
+        perf_summary = self.performance_monitor.get_performance_summary()
+        training_summary["performance"] = perf_summary
+
+        self.logger.info(f"training_completed: summary={training_summary}")
+
+        best_info = training_summary["best_model_info"]
+        self.logger.info(
+            f"Best model: Epoch {best_info['best_epoch']} with "
+            f"{best_info['metric_name']}={best_info['best_value']:.4f}"
+        )
+
+        self.distributed_manager.cleanup()
+        training_duration = time.perf_counter() - training_start
+        self.logger.info(f"Training finished in {training_duration:.2f}s.")
+        perf_summary = self.performance_monitor.get_performance_summary()
+        self.logger.info(f"Performance Summary: {perf_summary}")
 
     def _display_epoch_end(self, epoch, epoch_duration, epoch_metrics):
         epoch_metrics_str = ""

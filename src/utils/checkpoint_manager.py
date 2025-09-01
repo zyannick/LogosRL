@@ -3,14 +3,17 @@ import logging
 import time
 import traceback
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict
+from typing import Any, Dict
 
 import torch
+import torch.nn as nn
 
-if TYPE_CHECKING:
-    from models.trainer import MixtureOfExpertsTrainer
-
+from utils.configurations import MoERLConfig
 from utils.exceptions import TrainingError
+
+# if TYPE_CHECKING:
+#     from models.trainer import MixtureOfExpertsTrainer
+
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +76,10 @@ class CheckpointManager:
 
     def update(
         self,
-        trainer: "MixtureOfExpertsTrainer",
+        model: nn.Module,
+        tokenizer: nn.Module,
+        config: MoERLConfig,
+        device: torch.device,
         current_metrics: Dict[str, float],
         epoch: int,
     ) -> bool:
@@ -85,7 +91,8 @@ class CheckpointManager:
         Otherwise, increments the epochs without improvement counter.
 
         Args:
-            trainer (PPOMoETrainer): The trainer instance used for saving the checkpoint.
+            model (nn.Module): The model instance used for saving the checkpoint.
+            tokenizer (nn.Module): The tokenizer instance used for saving the checkpoint.
             current_metrics (Dict[str, float]): Dictionary of current metric values.
             epoch (int): The current epoch number.
 
@@ -101,7 +108,9 @@ class CheckpointManager:
             self.best_value = current_value
             self.best_epoch = epoch
             self.epochs_without_improvement = 0
-            self.save_checkpoint(trainer, epoch, self.best_metrics)
+            self.save_checkpoint(
+                model, tokenizer, config, device, epoch, self.best_metrics
+            )
 
             return True
         else:
@@ -121,7 +130,13 @@ class CheckpointManager:
         }
 
     def save_checkpoint(
-        self, trainer: "MixtureOfExpertsTrainer", epoch: int, metrics: Dict[str, float]
+        self,
+        model: nn.Module,
+        tokenizer: nn.Module,
+        config: MoERLConfig,
+        device: torch.device,
+        epoch: int,
+        metrics: Dict[str, float],
     ) -> str:
         """
         Saves the current training checkpoint, including the policy model, tokenizer, and metadata.
@@ -142,10 +157,10 @@ class CheckpointManager:
 
         try:
 
-            trainer.policy_model.save_pretrained(checkpoint_dir)
-            trainer.tokenizer.save_pretrained(checkpoint_dir)
+            model.save_pretrained(checkpoint_dir)
+            tokenizer.save_pretrained(checkpoint_dir)
 
-            self._save_metadata(checkpoint_dir, trainer, epoch, metrics)
+            self._save_metadata(checkpoint_dir, config, device, epoch, metrics)
 
             logger.info(
                 f"checkpoint_saved: epoch = {epoch}, path = {str(checkpoint_dir)}",
@@ -160,16 +175,17 @@ class CheckpointManager:
     def _save_metadata(
         self,
         checkpoint_dir: Path,
-        trainer: "MixtureOfExpertsTrainer",
+        config: MoERLConfig,
+        device: torch.device,
         epoch: int,
         metrics: Dict[str, float],
     ):
         metadata = {
             "epoch": epoch,
-            "config": trainer.config.model_dump(),
+            "config": config.model_dump(),
             "metrics": metrics,
             "timestamp": time.time(),
-            "device": str(trainer.device),
+            "device": str(device),
             "torch_version": torch.__version__,
         }
 
