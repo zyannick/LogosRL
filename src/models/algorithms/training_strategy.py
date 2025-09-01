@@ -140,7 +140,7 @@ class TrainingStrategy:
             if not epoch_metrics:
                 raise TrainingError(f"No valid batches processed in epoch {epoch}")
 
-            expert_usage = trainer.policy_model.expert_tracker.get_usage_stats()
+            expert_usage = trainer.policy_model.module.expert_tracker.get_usage_stats()
             self.expert_usage_stats.append(expert_usage)
             mlflow_log_metrics(
                 self.mlflow_client, self.config, expert_usage, step=epoch, run_id=run_id

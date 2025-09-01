@@ -106,7 +106,7 @@ class TrainingParams(BaseModel):
     learning_rate: float = Field(
         default=1e-5, description="Learning rate for the optimizer"
     )
-    batch_size: int = Field(default=8, description="Batch size for training")
+    batch_size: int = Field(default=16, description="Batch size for training")
     mini_batch_size: int = Field(default=4, description="Mini batch size for training")
     gradient_accumulation_steps: int = Field(
         default=4, description="Gradient accumulation steps"
@@ -138,16 +138,15 @@ class TrainingParams(BaseModel):
     use_8bit_optimizer: bool = Field(
         default=True, description="Whether to use 8-bit optimizer"
     )
-    num_epochs: int = Field(default=2, description="Number of training epochs")
+    num_epochs: int = Field(default=50, description="Number of training epochs")
     use_mixed_precision: bool = Field(
         default=True, description="Whether to use mixed precision training"
     )
     gamma: float = Field(default=0.99, description="Discount factor for rewards")
-    eval_episodes: int = Field(default=5, description="Number of evaluation episodes")
     gae_lambda: float = Field(
         default=0.95, description="GAE lambda for advantage calculation"
     )
-    ppo_epochs: int = Field(default=1, description="Number of PPO epochs")
+    ppo_epochs: int = Field(default=4, description="Number of PPO epochs")
     use_amp: bool = Field(
         default=True, description="Whether to use mixed precision training"
     )
