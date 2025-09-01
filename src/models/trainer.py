@@ -12,20 +12,18 @@ from transformers import (
     AutoTokenizer,
 )
 
+from models.algorithms.a2c_training_strategy import A2CTrainingStrategy
+from models.algorithms.ppo_training_strategy import PPOTrainingStrategy
 from models.environnement import GSM8KEnvironment
 from models.expert_usage_tracker import (
     MoEModelWithTracking,
     PatchedAutoModelForCausalLMWithValueHead,
 )
 from models.training_monitoring import PerformanceMonitor
-from models.training_strategy import TrainingStrategy
 from utils.checkpoint_manager import CheckpointManager
 from utils.configurations import MoERLConfig
 from utils.exceptions import ResourceError, TrainingError
 from utils.ressource_manager import TrainingResourceManager
-
-# from trl.core import LengthSampler
-
 
 
 class MixtureOfExpertsTrainer:
@@ -39,46 +37,10 @@ class MixtureOfExpertsTrainer:
         environment: GSM8KEnvironment,
         logger: logging.Logger,
         mlflow_client: mlflow.MlflowClient,
-        strategy: Optional[TrainingStrategy] = None,
+        strategy: Optional[PPOTrainingStrategy | A2CTrainingStrategy] = None,
         checkpoint_manager: Optional[CheckpointManager] = None,
         performance_monitor: Optional[PerformanceMonitor] = None,
     ):
-        """
-        Initializes the PPO-MoE trainer with the provided configuration, models, environment, and utilities.
-
-        Args:
-            config (MoERLConfig): Configuration object containing training parameters and settings.
-            tokenizer (AutoTokenizer): Tokenizer used for processing input and output sequences.
-            policy_model (MoEModelWithTracking): The policy model to be trained, supporting Mixture-of-Experts and tracking.
-            reference_model (PatchedAutoModelForCausalLMWithValueHead): Reference model used for reward calculation and comparison.
-            environment (GSM8KEnvironment): The RL environment for training, typically a math problem dataset.
-            logger (logging.Logger): Logger instance for tracking training progress and events.
-            mlflow_client (mlflow.MlflowClient): MLflow client for experiment tracking and logging.
-            strategy (Optional[PPOTrainingStrategy], optional): Custom PPO training strategy. Defaults to None.
-            checkpoint_manager (Optional[CheckpointManager], optional): Manager for saving and loading checkpoints. Defaults to None.
-            performance_monitor (Optional[PerformanceMonitor], optional): Monitor for tracking performance metrics. Defaults to None.
-
-        Attributes:
-            config (MoERLConfig): Trainer configuration.
-            training_config: Training parameters extracted from config.
-            logger (logging.Logger): Logger instance.
-            mlflow_client (mlflow.MlflowClient): MLflow client.
-            device (torch.device): Device used for training (CPU or CUDA).
-            policy_model (MoEModelWithTracking): Policy model.
-            reference_model (PatchedAutoModelForCausalLMWithValueHead): Reference model.
-            tokenizer (AutoTokenizer): Tokenizer.
-            environment (GSM8KEnvironment): RL environment.
-            optimizer (torch.optim.Optimizer or bnb.optim.AdamW8bit): Optimizer for training.
-            resource_manager (TrainingResourceManager): Resource manager for training.
-            performance_monitor (PerformanceMonitor): Performance monitor.
-            checkpoint_manager (CheckpointManager): Checkpoint manager.
-            strategy (PPOTrainingStrategy): PPO training strategy.
-            generation_kwargs (dict): Generation keyword arguments for model inference.
-            output_length_sampler (LengthSampler): Sampler for output sequence lengths.
-
-        Logs:
-            Trainer initialization details including device and configuration.
-        """
         self.config = config
         self.training_config = self.config.training_params
 
@@ -105,13 +67,24 @@ class MixtureOfExpertsTrainer:
         self.checkpoint_manager = checkpoint_manager or CheckpointManager(
             config.checkpoint_path
         )
-        self.strategy = strategy or TrainingStrategy(
-            self.resource_manager,
-            self.performance_monitor,
-            self.logger,
-            self.config,
-            self.mlflow_client,
-        )
+        if strategy is not None:
+            self.strategy = strategy
+        elif self.config.algorithm == "ppo":
+            self.strategy = PPOTrainingStrategy(
+                self.resource_manager,
+                self.performance_monitor,
+                self.logger,
+                self.config,
+                self.mlflow_client,
+            )
+        elif self.config.algorithm == "a2c":
+            self.strategy = A2CTrainingStrategy(
+                self.resource_manager,
+                self.performance_monitor,
+                self.logger,
+                self.config,
+                self.mlflow_client,
+            )
 
         self.generation_kwargs = self._get_generation_kwargs()
 
@@ -327,8 +300,6 @@ class MixtureOfExpertsTrainer:
                 model_updated = self.checkpoint_manager.update(
                     self,
                     current_metrics=epoch_metrics,
-                    # model_state=self.policy_model.state_dict(),
-                    # optimizer_state=self.optimizer.state_dict(),
                     epoch=epoch,
                 )
 

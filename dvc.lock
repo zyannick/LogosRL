@@ -1,0 +1,18 @@
+schema: '2.0'
+stages:
+  build_docker:
+    cmd: docker build -t moe-rl-app .
+    deps:
+    - path: Dockerfile
+      hash: md5
+      md5: 58ab91b1cb0e5064b6a4ad1201a94160
+      size: 556
+    - path: requirements.txt
+      hash: md5
+      md5: 0d51afb0dbca75cc6980380676fd9fa0
+      size: 146
+    - path: src/
+      hash: md5
+      md5: f9e76b7fb73d673b96295cafe15f7d31.dir
+      size: 184016
+      nfiles: 21

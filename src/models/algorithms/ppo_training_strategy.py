@@ -1,16 +1,15 @@
 import logging
 import time
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Tuple
+from typing import TYPE_CHECKING, Dict, List, Tuple
 
-import evaluate
 import mlflow
 import numpy as np
 import torch
-from torch.amp import GradScaler, autocast
+from torch.amp import autocast
 from tqdm import tqdm
 
-from models.training_monitoring import PerformanceMetrics, PerformanceMonitor
+from models.algorithms.training_strategy import TrainingStrategy
+from models.training_monitoring import PerformanceMonitor
 from models.utils.loss import (
     compute_advantages,
     compute_entropy_loss,
@@ -20,10 +19,6 @@ from models.utils.loss import (
     masked_mean,
 )
 from models.utils.metrics import compute_nlp_metrics, mlflow_log_metrics
-from models.utils.vizualisation import (
-    plot_layer_wise_expert_heatmap,
-    plot_overall_expert_utilization,
-)
 from utils.batch_data import BatchData
 from utils.configurations import MoERLConfig
 from utils.exceptions import TrainingError
@@ -67,7 +62,7 @@ class AdaptiveKLController:
         self.kl_coef *= factor
 
 
-class TrainingStrategy:
+class PPOTrainingStrategy(TrainingStrategy):
 
     def __init__(
         self,
@@ -77,43 +72,12 @@ class TrainingStrategy:
         config: MoERLConfig,
         mlflow_client: mlflow.MlflowClient,
     ):
-        """
-        Initializes the training strategy with required resources, monitoring tools, logging, configuration, and metrics.
-
-        Args:
-            resource_manager (TrainingResourceManager): Manages training resources such as GPUs and memory.
-            performance_monitor (PerformanceMonitor): Monitors training performance and metrics.
-            logger (logging.Logger): Logger for recording training events and information.
-            config (MoERLConfig): Configuration object containing training parameters and settings.
-            mlflow_client (mlflow.MlflowClient): MLflow client for experiment tracking and logging.
-
-        Attributes:
-            resource_manager (TrainingResourceManager): Instance managing training resources.
-            performance_monitor (PerformanceMonitor): Instance monitoring training performance.
-            logger (logging.Logger): Logger for training events.
-            config (MoERLConfig): Training configuration.
-            mlflow_client (mlflow.MlflowClient): MLflow client for logging.
-            bleu_metric: BLEU metric for evaluation.
-            rouge_metric: ROUGE metric for evaluation.
-            expert_usage_stats (List[Dict[str, Any]]): Tracks expert usage statistics.
-            scaler (GradScaler): Gradient scaler for mixed precision training.
-            kl_controller (AdaptiveKLController): Controller for adaptive KL divergence during training.
-        """
-        self.resource_manager = resource_manager
-        self.performance_monitor = performance_monitor
-        self.logger = logger
-        self.config = config
-        self.mlflow_client = mlflow_client
-        self.bleu_metric = evaluate.load("bleu")
-        self.rouge_metric = evaluate.load("rouge")
-        self.expert_usage_stats: List[Dict[str, Any]] = []
-
-        self.scaler = GradScaler(
-            init_scale=self.config.training_params.amp_init_scale,
-            growth_factor=self.config.training_params.amp_growth_factor,
-            backoff_factor=self.config.training_params.amp_backoff_factor,
-            growth_interval=self.config.training_params.amp_growth_interval,
-            enabled=self.config.training_params.use_amp,  # Ensure it's enabled
+        super().__init__(
+            resource_manager=resource_manager,
+            performance_monitor=performance_monitor,
+            logger=logger,
+            config=config,
+            mlflow_client=mlflow_client,
         )
 
         self.kl_controller = AdaptiveKLController(
@@ -122,145 +86,9 @@ class TrainingStrategy:
             horizon=10000,
         )
 
-    def run_training_step(
-        self, trainer: "MixtureOfExpertsTrainer", dataloader, epoch: int, run_id: str
-    ) -> Dict[str, float]:
-        """
-        Executes a single training epoch, processing each batch in the provided dataloader.
-
-        This method performs the following steps for each batch:
-        - Resets expert tracker statistics if available.
-        - Iterates through the dataloader, collecting rollouts and updating the policy.
-        - Logs metrics to MLflow and records performance statistics.
-        - Tracks and visualizes expert usage statistics.
-        - Handles exceptions during batch processing and raises errors if no valid batches are processed.
-
-        Args:
-            trainer (PPOMoETrainer): The trainer object containing the policy model and training logic.
-            dataloader: An iterable providing batches of training data.
-            epoch (int): The current epoch number.
-            run_id (str): The MLflow run identifier for logging metrics.
-
-        Returns:
-            Dict[str, float]: Aggregated metrics for the epoch.
-        """
-
-        epoch_metrics = []
-
-        if hasattr(trainer.policy_model, "expert_tracker"):
-            trainer.policy_model.expert_tracker.reset_stats()
-
-        progress_bar = tqdm(
-            enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch}"
-        )
-
-        self.logger.info(f"Starting epoch {epoch} with {len(dataloader)} batches.")
-
-        for batch_idx, batch_data in progress_bar:
-            with self.resource_manager.managed_computation("batch_processing"):
-                try:
-                    if batch_data is None:
-                        continue
-
-                    batch_start_time = time.perf_counter()
-
-                    rollout_start_time = time.perf_counter()
-                    rollout_data, metrics = self._collect_rollout(trainer, batch_data)
-                    rollout_time = time.perf_counter() - rollout_start_time
-
-                    update_policy_start_time = time.perf_counter()
-                    update_metrics = self._update_policy(trainer, rollout_data)
-                    update_policy_time = time.perf_counter() - update_policy_start_time
-
-                    metrics.update(update_metrics)
-                    epoch_metrics.append(metrics)
-
-                    mlflow_log_metrics(
-                        self.mlflow_client,
-                        self.config,
-                        metrics,
-                        step=epoch * len(dataloader) + batch_idx,
-                        run_id=run_id,
-                    )
-
-                    processing_time = time.perf_counter() - batch_start_time
-                    memory_stats = self.resource_manager.check_gpu_memory()
-
-                    perf_metric = PerformanceMetrics(
-                        batch_processing_time=processing_time,
-                        generation_time=metrics.get("generation_time", 0),
-                        reward_computation_time=metrics.get("reward_time", 0),
-                        gpu_memory_usage=memory_stats["used"],
-                        rollout_time=rollout_time,
-                        update_policy_time=update_policy_time,
-                        cpu_usage=0.0,
-                        timestamp=time.time(),
-                    )
-                    self.performance_monitor.record_metric(perf_metric)
-
-                    display_metrics = {
-                        "reward": f"{metrics.get('reward', 0):.4f}",
-                        "policy_loss": f"{metrics.get('policy_loss', 0):.4f}",
-                        "entropy_loss": f"{metrics.get('entropy_loss', 0):.4f}",
-                        "kl_div": f"{metrics.get('kl_div', 0):.4f}",
-                    }
-                    progress_bar.set_postfix(**display_metrics)
-
-                except Exception as e:
-                    self.logger.error(
-                        f"Batch processing failed: epoch={epoch}, batch_idx={batch_idx}, error={e}",
-                        exc_info=True,
-                    )
-                    raise
-
-            if not epoch_metrics:
-                raise TrainingError(f"No valid batches processed in epoch {epoch}")
-
-            expert_usage = trainer.policy_model.expert_tracker.get_usage_stats()
-            self.expert_usage_stats.append(expert_usage)
-            mlflow_log_metrics(
-                self.mlflow_client, self.config, expert_usage, step=epoch, run_id=run_id
-            )
-            mlflow_log_metrics(
-                self.mlflow_client, self.config, expert_usage, step=epoch, run_id=run_id
-            )
-
-        vizualization_path = Path(self.config.checkpoint_path / "visualizations")
-        vizualization_path.mkdir(parents=True, exist_ok=True)
-
-        plot_layer_wise_expert_heatmap(
-            self.expert_usage_stats, vizualization_path, epoch
-        )
-        plot_overall_expert_utilization(
-            self.expert_usage_stats, vizualization_path, epoch
-        )
-
-        return self._aggregate_metrics(epoch_metrics)
-
     def _collect_rollout(
         self, trainer: "MixtureOfExpertsTrainer", batch_data: BatchData
     ) -> Tuple[Dict, Dict]:
-        """
-        Collects a rollout for PPO training using a Mixture-of-Experts (MoE) policy model.
-
-        This method generates responses from the policy model given input queries, computes rewards,
-        KL divergence penalties, and various NLP metrics, and returns the processed rollout data
-        and metrics for training.
-
-        Args:
-            trainer (PPOMoETrainer): The PPO trainer instance containing models, tokenizer, and configuration.
-            batch_data (BatchData): Batch of input data including queries, input IDs, and ground truths.
-
-        Returns:
-            Tuple[Dict, Dict]:
-                - rollout_data (Dict): Dictionary containing tensors for queries, responses, log probabilities,
-                  value estimates, rewards, reference log probabilities, response mask, and attention mask.
-                - metrics (Dict): Dictionary of computed metrics including KL coefficient, KL divergence,
-                  average reward, and additional NLP metrics (BLEU, ROUGE, etc.).
-
-        Raises:
-            TrainingError: If batch_data is None or batch preparation fails.
-        """
         if batch_data is None:
             raise TrainingError("Failed to prepare batch.")
 
@@ -553,31 +381,6 @@ class TrainingStrategy:
             )
 
         return not overflow_occurred
-
-    def _aggregate_metrics(
-        self, batch_metrics: List[Dict[str, float]]
-    ) -> Dict[str, float]:
-        """
-        Aggregates a list of metric dictionaries by computing the mean and standard deviation for each metric key.
-
-        Args:
-            batch_metrics (List[Dict[str, float]]): A list of dictionaries containing metric names and their float values.
-
-        Returns:
-            Dict[str, float]: A dictionary where each key is prefixed with 'avg_' or 'std_' followed by the metric name,
-                              representing the average and standard deviation of each metric across the batch.
-                              Returns an empty dictionary if batch_metrics is empty.
-        """
-        if not batch_metrics:
-            return {}
-        aggregated = {}
-        all_keys = set().union(*[m.keys() for m in batch_metrics])
-        for k in all_keys:
-            vals = [m[k] for m in batch_metrics if k in m and m[k] is not None]
-            if vals:
-                aggregated[f"avg_{k}"] = float(np.mean(vals))
-                aggregated[f"std_{k}"] = float(np.std(vals))
-        return aggregated
 
     def evaluate(
         self, trainer: "MixtureOfExpertsTrainer", test_dataloader, run_id: str = None

@@ -51,11 +51,11 @@ class SystemParams(BaseModel):
 
 class BaseParams(BaseModel):
     output_dir: str = Field(
-        default="./ppo_moe_outputs", description="Directory to save model outputs"
+        default="./moe_outputs", description="Directory to save model outputs"
     )
     data_dir: str = Field(default="./data", description="Directory to save data")
     project_name: str = Field(
-        default="ppo-moe-gsm8k", description="MLflow project name"
+        default="moe-usage", description="MLflow project name"
     )
     seed: int = Field(default=42, description="Random seed")
 
@@ -90,7 +90,7 @@ class LoggingParams(BaseModel):
     log_dir: str = Field(default="./logs", description="Directory to save logs")
     log_level: str = Field(default="info", description="Logging level")
     experiment_name: str = Field(
-        default="ppo_moe_experiment", description="MLflow experiment name"
+        default="moe_experiment", description="MLflow experiment name"
     )
     mlflow_tracking_uri: str = Field(
         default="http://localhost:5000", description="MLflow tracking URI"
@@ -233,6 +233,10 @@ class MoERLConfig(BaseModel):
                 Path(self.base_params.output_dir) / "checkpoints" / run_name
             )
             self._checkpoint_path_generated = True
+
+    @property
+    def algorithm(self):
+        return self.training_params.algorithm
 
     @property
     def experiment_name(self):
