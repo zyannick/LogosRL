@@ -16,6 +16,3 @@ nltk==3.9.1
 seaborn==0.13.2
 pytest
 dvc
-awscli
-dvc-s3
-dvc[gdrive]

@@ -9,7 +9,18 @@
 ![MLflow](https://img.shields.io/badge/MLflow-Tracking-blue?logo=mlflow)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
-In this project, we will try to implement from scratch reinforcement learning algorithms for mathematical reasoning and de novo proteins generations.
+LogosRL is a research and engineering toolkit for fine-tuning language models on complex reasoning tasks using reinforcement learning. This project provides a production-grade, end-to-end MLOps pipeline for implementing, comparing, and analyzing RL algorithms (PPO, A2C, SAC) for applications in mathematical reasoning and de novo protein generation.
+
+
+## Architectural Goals
+
+This project is built with a professional MLOps philosophy, emphasizing:
+
+    - Reproducibility: A fully containerized environment with versioned data and models ensures that any experiment can be perfectly reproduced.
+
+    - Scalability: The architecture is designed for multi-GPU, distributed training and can be deployed on professional HPC clusters using Slurm.
+
+    - Modularity: A clean separation of concerns between the pipeline, data management, training logic, and algorithmic strategies makes the system easy to extend and maintain.
 
 ## Usage
 
@@ -27,8 +38,8 @@ This project uses Docker and DVC to ensure a completely reproducible environment
 1. Clone the Repository
 
     ```bash
-    git clone https://github.com/zyannick/moe-rl-finetune.git
-    cd moe-rl-finetune
+    git clone https://github.com/zyannick/LogosRL.git
+    cd LogosRL
     ```
 
 
@@ -55,8 +66,10 @@ This project uses Docker and DVC to ensure a completely reproducible environment
     This single command executes the entire DVC pipeline, from data preparation to training and evaluation.
 
     ```bash
-    # Launch the full pipeline inside a docker
-    dvc repro
+    # Build the Docker image
+    dvc repro build_docker
+    # Launch the full pipeline inside a docker. This will use dvc inside the docker
+    ./run_local.sh repro run_pipeline
     ```
     or
     ```bash
@@ -72,3 +85,28 @@ This project uses Docker and DVC to ensure a completely reproducible environment
     mlflow server --backend-store-uri sqlite:///moe_outputs/mlflow.db --port 5000
     ```
     Then navigate to `http://localhost:5000` in your browser.
+
+
+### Running on a Slurm
+
+I have also provided a script to train the models on a Slurm (you should update the email to get the updates on your email) :
+
+```bash
+mkdir -p data moe_outputs mlruns hf_cache mpl_config
+./build_docker.sh
+# First, create the directory for Slurm logs
+mkdir -p slurm_logs
+# Submit the job
+sbatch submit_dvc_slurm.sbatch
+```
+
+
+## Results
+
+### PPO
+
+
+### A2C
+
+
+### SAC

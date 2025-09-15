@@ -10,6 +10,7 @@ hf_cache/
 data/
 .vscode
 moe_outputs/
+slurm_logs/
 
 # Distribution / packaging
 .Python

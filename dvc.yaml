@@ -1,13 +1,13 @@
 stages:
   build_docker:
-    cmd: docker build -t moe-rl-app .
+    cmd: docker build -t ataraxai/logos-rl:v1.0 .
     deps:
       - src/
       - Dockerfile
       - requirements.txt
 
   prepare_data:
-    cmd: ./run_in_docker.sh prepare_data
+    cmd:  torchrun --nproc_per_node=auto src/run_pipeline.py --pipeline_stage prepare_data
     deps:
       - src/pipeline.py
       - src/models/data_preparer.py
@@ -16,7 +16,7 @@ stages:
       - data/raw/gsm8k
 
   run_pipeline:
-    cmd: ./run_in_docker.sh full_pipeline
+    cmd: torchrun --nproc_per_node=auto src/run_pipeline.py --pipeline_stage full_pipeline
     deps:
       - src/
       - data/raw/gsm8k

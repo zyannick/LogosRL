@@ -1,28 +1,13 @@
 schema: '2.0'
 stages:
-  build_docker:
-    cmd: docker build -t moe-rl-app .
-    deps:
-    - path: Dockerfile
-      hash: md5
-      md5: 703d4d9aac2b2a96b18a3d2408836ec6
-      size: 736
-    - path: requirements.txt
-      hash: md5
-      md5: 8d6aedf8f6c008ca3ed755975d2147dd
-      size: 287
-    - path: src/
-      hash: md5
-      md5: 68a479ce90ee914f0902ab416869368d.dir
-      size: 437678
-      nfiles: 44
   prepare_data:
-    cmd: ./run_in_docker.sh prepare_data
+    cmd: torchrun --nproc_per_node=auto src/run_pipeline.py --pipeline_stage 
+      prepare_data
     deps:
     - path: run_in_docker.sh
       hash: md5
-      md5: 634a3f97ec40b3ec3294488c13289d12
-      size: 944
+      md5: 4d49b0ae43beb1ea26d31c36169b4765
+      size: 947
       isexec: true
     - path: src/models/data_preparer.py
       hash: md5
@@ -30,8 +15,8 @@ stages:
       size: 1697
     - path: src/pipeline.py
       hash: md5
-      md5: 8f147014670254b015298dfdc8a1f1cf
-      size: 46358
+      md5: a2d1037a28c20dfb008356124a8aa73a
+      size: 46994
     outs:
     - path: data/raw/gsm8k
       hash: md5
