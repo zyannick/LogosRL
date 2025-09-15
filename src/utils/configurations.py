@@ -65,7 +65,7 @@ class ModelParams(BaseModel):
         default="allenai/OLMoE-1B-7B-0924",
         description="Pretrained model name or path",
     )
-    # Qwen/Qwen1.5-MoE-A2.7B, allenai/OLMoE-1B-7B-0924
+    # Qwen/Qwen1.5-MoE-A2.7B, allenai/OLMoE-1B-7B-0924 , ibm-granite/granite-3.1-3b-a800m-instruct
     dataset_name: str = Field(default="GSM8K", description="Name of the dataset")
 
     @field_validator("pretrained_model_name")

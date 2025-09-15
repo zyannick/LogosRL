@@ -46,6 +46,7 @@ class TrainingStrategy:
         self.bleu_metric = evaluate.load("bleu")
         self.rouge_metric = evaluate.load("rouge")
         self.expert_usage_stats: List[Dict[str, Any]] = []
+        self.float16_type = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
         self.scaler = GradScaler(
             init_scale=self.config.training_params.amp_init_scale,

@@ -61,7 +61,7 @@ class A2CTrainingStrategy(TrainingStrategy):
             with autocast(
                 device_type="cuda" if torch.cuda.is_available() else "cpu",
                 enabled=trainer.config.training_params.use_mixed_precision,
-                dtype=torch.bfloat16,
+                dtype=self.float16_type,
             ):
                 response_tensors = trainer._generate_responses(query_tensors)
         generation_time = time.perf_counter() - generation_start
@@ -79,7 +79,7 @@ class A2CTrainingStrategy(TrainingStrategy):
             with autocast(
                 device_type="cuda" if torch.cuda.is_available() else "cpu",
                 enabled=trainer.config.training_params.use_mixed_precision,
-                dtype=torch.bfloat16,
+                dtype=self.float16_type,
             ):
                 logits, _, values = trainer.policy_model(
                     full_tensors, attention_mask=attention_mask, return_dict=True
@@ -168,7 +168,7 @@ class A2CTrainingStrategy(TrainingStrategy):
         with autocast(
             device_type="cuda" if torch.cuda.is_available() else "cpu",
             enabled=trainer.config.training_params.use_mixed_precision,
-            dtype=torch.bfloat16,
+            dtype=self.float16_type,
         ):
             logits, _, new_values = trainer.policy_model(
                 rollout_data["full_tensors"], attention_mask=rollout_data["attn_mask"]
@@ -263,7 +263,7 @@ class A2CTrainingStrategy(TrainingStrategy):
                     with autocast(
                         device_type="cuda" if torch.cuda.is_available() else "cpu",
                         enabled=trainer.config.training_params.use_mixed_precision,
-                        dtype=torch.bfloat16,
+                        dtype=self.float16_type,
                     ):
                         generation_start_time = time.perf_counter()
                         response_tensors = trainer._generate_responses(query_tensors)
@@ -283,7 +283,7 @@ class A2CTrainingStrategy(TrainingStrategy):
                     with autocast(
                         device_type="cuda" if torch.cuda.is_available() else "cpu",
                         enabled=trainer.config.training_params.use_mixed_precision,
-                        dtype=torch.bfloat16,
+                        dtype=self.float16_type,
                     ):
                         logits, _, values = trainer.policy_model(
                             full_tensors,

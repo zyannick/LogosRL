@@ -5,14 +5,36 @@ stages:
     deps:
     - path: Dockerfile
       hash: md5
-      md5: 0d76954aa8e7f3b9e6217fed2fc1d296
-      size: 582
+      md5: 703d4d9aac2b2a96b18a3d2408836ec6
+      size: 736
     - path: requirements.txt
       hash: md5
-      md5: 0d51afb0dbca75cc6980380676fd9fa0
-      size: 146
+      md5: 8d6aedf8f6c008ca3ed755975d2147dd
+      size: 287
     - path: src/
       hash: md5
-      md5: 64347568c0a2ce68f4dec76f3035b4ec.dir
-      size: 430607
-      nfiles: 43
+      md5: 68a479ce90ee914f0902ab416869368d.dir
+      size: 437678
+      nfiles: 44
+  prepare_data:
+    cmd: ./run_in_docker.sh prepare_data
+    deps:
+    - path: run_in_docker.sh
+      hash: md5
+      md5: 634a3f97ec40b3ec3294488c13289d12
+      size: 944
+      isexec: true
+    - path: src/models/data_preparer.py
+      hash: md5
+      md5: 477f5e6fbac3430a55bdcfdbeb3f4ee6
+      size: 1697
+    - path: src/pipeline.py
+      hash: md5
+      md5: 8f147014670254b015298dfdc8a1f1cf
+      size: 46358
+    outs:
+    - path: data/raw/gsm8k
+      hash: md5
+      md5: 570e33513fab89d380834923ef266b24.dir
+      size: 4682873
+      nfiles: 6

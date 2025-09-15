@@ -159,6 +159,19 @@ class PipelineResourceManager:
         self.cleanup()
 
 
+def known_gate_patterns(model_name: str) -> str:
+    if model_name in [
+        "Qwen/Qwen1.5-MoE-A2.7B",
+        "Qwen/Qwen-MoE-14B",
+        "allenai/OLMoE-1B-7B-0924",
+    ]:
+        return ".mlp.gate"
+    elif model_name == "ibm-granite/granite-3.1-3b-a800m-instruct":
+        return ".block_sparse_moe.router.layer"
+    else:
+        return ".gate"
+
+
 class ModelManager:
 
     def __init__(
@@ -186,6 +199,7 @@ class ModelManager:
         self.config = config
         self.logger = logger
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.float16_type = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         self.tokenizer: Optional[AutoTokenizer] = None
         self.policy_model: Optional[MoEModelWithTracking] = None
         self.reference_model: Optional[PatchedAutoModelForCausalLMWithValueHead] = None
@@ -221,7 +235,11 @@ class ModelManager:
             self.logger.info(f"Rank {self.dist_manager.rank}: Wrapping models.")
             self.policy_model = self._create_peft_model(base_model, "policy_model")
             self.policy_model = MoEModelWithTracking(
-                model=self.policy_model, logger=self.logger
+                model=self.policy_model,
+                logger=self.logger,
+                gate_name_pattern=known_gate_patterns(
+                    self.config.pretrained_model_name
+                ),
             )
 
             self.reference_model = (
@@ -354,7 +372,7 @@ class ModelManager:
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_compute_dtype=self.float16_type,
                 bnb_4bit_use_double_quant=True,
             )
 
@@ -362,9 +380,11 @@ class ModelManager:
             base_model = AutoModelForCausalLM.from_pretrained(
                 self.config.pretrained_model_name,
                 quantization_config=quantization_config,
-                dtype=torch.bfloat16,
+                dtype=self.float16_type,
                 device_map=None,
             )
+
+            # print(base_model)
 
             if torch.cuda.is_available():
                 memory_allocated = torch.cuda.memory_allocated()
